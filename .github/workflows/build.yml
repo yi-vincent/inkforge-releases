@@ -1,0 +1,220 @@
+name: Desktop build
+
+# 本仓库是公开的：只放安装包与本 workflow。InkForge 源码在私有仓库（vars.CONTENT_REPO），构建时用只读令牌临时拉取。
+# 手动（或 scripts/release.mjs 的 repository_dispatch）指定 ref 与版本号 → 三个平台各自打包 + 启动安装版冒烟
+# → 安装包直接上传到本仓库 v<版本> 的「草稿」Release（草稿只有仓库写权限的人看得到，不经过公开 artifact）。
+# 验证无误后，在 Releases 页点发布，再用本机 scripts/publish-release.mjs 登记官网。
+#
+# 公开仓库的日志谁都能看，所以：
+#   - 不用 actions/checkout（会打印提交标题 / 分支名）；用 git init + fetch，令牌只经 http.extraheader 传入单条命令；
+#   - 安装 / 构建 / 冒烟 / 上传的输出一律重定向到 _priv/，公开日志只写通过 / 失败、用时、退出码；
+#   - 失败时若配了 ARTIFACT_PASSPHRASE，把 _priv 日志加密后作为 artifact 上传，没配就不传；
+#   - 只接 workflow_dispatch / repository_dispatch，不接任何 PR 事件；
+#   - 第三方 action 固定到提交 SHA（后面注释是对应的 tag）。
+#
+# 解密失败日志：
+#   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in logs-<平台>.tar.gz.enc | tar xzf -
+
+run-name: desktop-build
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "私有仓库的分支名或 commit sha"
+        required: true
+        default: main
+      version:
+        description: "版本号，如 1.3.0（会写进安装包文件名，并创建 v<版本> 草稿 Release）"
+        required: true
+  repository_dispatch:
+    types: [inkforge-build]
+
+concurrency:
+  group: desktop-build-${{ github.event.inputs.version || github.event.client_payload.version }}
+  cancel-in-progress: false
+
+env:
+  BUILD_REF: ${{ github.event.inputs.ref || github.event.client_payload.ref }}
+  BUILD_VERSION: ${{ github.event.inputs.version || github.event.client_payload.version }}
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Preflight and draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTENT_REPO: ${{ vars.CONTENT_REPO }}
+          HAS_CONTENT_TOKEN: ${{ secrets.CONTENT_REPO_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          miss=""
+          [ -n "${CONTENT_REPO}" ] || miss="$miss vars.CONTENT_REPO"
+          [ "${HAS_CONTENT_TOKEN}" = "true" ] || miss="$miss secrets.CONTENT_REPO_TOKEN"
+          if [ -n "$miss" ]; then
+            echo "::error::缺少配置：$miss（Settings → Secrets and variables → Actions）"
+            exit 1
+          fi
+          printf '%s' "$BUILD_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::版本号格式应为 1.2.3"; exit 1; }
+          printf '%s' "$BUILD_REF" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::ref 含非法字符"; exit 1; }
+          if gh release view "v${BUILD_VERSION}" >/dev/null 2>&1; then
+            is_draft=$(gh release view "v${BUILD_VERSION}" --json isDraft --jq .isDraft)
+            [ "$is_draft" = "true" ] || { echo "::error::v${BUILD_VERSION} 已正式发布，不能覆盖；换一个版本号"; exit 1; }
+            echo "草稿 v${BUILD_VERSION} 已存在，沿用并覆盖同名文件"
+          else
+            gh release create "v${BUILD_VERSION}" --draft --title "InkForge v${BUILD_VERSION}" --notes "构建中，未验证。验证无误后改写更新说明再发布。" >/dev/null
+            echo "已创建草稿 v${BUILD_VERSION}"
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mac-arm64
+            os: macos-14
+            dist: dist:mac
+            exe: release/mac-arm64/InkForge.app/Contents/MacOS/InkForge
+          - name: mac-x64
+            os: macos-15-intel
+            dist: dist:mac-x64
+            exe: release/mac/InkForge.app/Contents/MacOS/InkForge
+          - name: win-x64
+            os: windows-latest
+            dist: dist:win
+            exe: release/win-unpacked/InkForge.exe
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Helper
+        run: |
+          mkdir -p _priv
+          cat > _priv/q.sh <<'SH'
+          # q <名称> <命令...>：输出进 _priv/<名称>.log，公开日志只写通过/失败
+          q() {
+            local name=$1; shift
+            local t0=$SECONDS
+            "$@" >"_priv/${name}.log" 2>&1
+            local rc=$?
+            if [ "$rc" -eq 0 ]; then echo "✓ ${name}（用时 $((SECONDS - t0))s，退出码 0）"; else echo "✗ ${name}（用时 $((SECONDS - t0))s，退出码 ${rc}）"; fi
+            return "$rc"
+          }
+          SH
+
+      - name: Checkout source (private)
+        env:
+          CONTENT_REPO: ${{ vars.CONTENT_REPO }}
+          TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+        run: |
+          set +e -uo pipefail
+          source _priv/q.sh
+          fetch_src() (
+            set -e
+            AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+            mkdir -p src && cd src
+            git init -q
+            git remote add origin "https://github.com/${CONTENT_REPO}.git"
+            SHA=$BUILD_REF
+            if ! printf '%s' "$SHA" | grep -qiE '^[0-9a-f]{40}$'; then
+              SHA=$(git -c http.extraheader="AUTHORIZATION: basic ${AUTH}" ls-remote origin "$BUILD_REF" "refs/heads/$BUILD_REF" | awk 'NF { print $1; exit }')
+              [ -n "$SHA" ] || { echo "无法把 ref 解析成 sha"; exit 1; }
+            fi
+            git -c http.extraheader="AUTHORIZATION: basic ${AUTH}" fetch -q --depth 1 origin "$SHA"
+            git checkout -q FETCH_HEAD
+          )
+          q checkout fetch_src
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          # 不开 cache：缓存键 / 路径会进公开日志，公开仓库的缓存也可被其它 workflow 恢复
+
+      - name: Set version
+        run: |
+          set +e -uo pipefail
+          source _priv/q.sh
+          set_version() (
+            set -e
+            cd src
+            for d in server web desktop; do
+              node -e 'const fs=require("fs");const f=process.argv[1]+"/package.json";const j=JSON.parse(fs.readFileSync(f,"utf8"));j.version=process.env.BUILD_VERSION;fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n");' "$d"
+            done
+          )
+          q version set_version
+
+      - name: Install
+        run: |
+          set +e -uo pipefail
+          source _priv/q.sh
+          for d in server web desktop; do
+            q "install-$d" bash -c "cd src/$d && npm ci --no-audit --no-fund" || exit 1
+          done
+
+      - name: Build installer
+        env:
+          DIST: ${{ matrix.dist }}
+        run: |
+          set +e -uo pipefail
+          source _priv/q.sh
+          q build bash -c 'cd src/desktop && npm run "$DIST" -- --publish never'
+
+      - name: Smoke test packaged app
+        env:
+          EXE: ${{ matrix.exe }}
+        run: |
+          set +e -uo pipefail
+          source _priv/q.sh
+          q smoke bash -c 'cd src/desktop && node scripts/smoke-packaged.mjs "$EXE"'
+
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e -uo pipefail
+          source _priv/q.sh
+          shopt -s nullglob
+          files=(src/desktop/release/*.dmg src/desktop/release/*.exe)
+          [ "${#files[@]}" -gt 0 ] || { echo "✗ 没找到安装包"; exit 1; }
+          q upload gh release upload "v${BUILD_VERSION}" "${files[@]}" --clobber
+          rc=$?
+          [ "$rc" -eq 0 ] && echo "已上传 ${#files[@]} 个安装包到草稿 v${BUILD_VERSION}"
+          exit "$rc"
+
+      - name: Encrypt failure logs
+        if: failure()
+        env:
+          PASS: ${{ secrets.ARTIFACT_PASSPHRASE }}
+        run: |
+          set -uo pipefail
+          if [ -z "${PASS}" ]; then
+            echo "::warning::未配置 ARTIFACT_PASSPHRASE，失败日志不上传（公开仓库不放明文）"
+            exit 0
+          fi
+          mkdir -p _out
+          tar czf - _priv 2>/dev/null | openssl enc -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -salt -pass env:PASS -out "_out/logs-${{ matrix.name }}.tar.gz.enc"
+
+      - name: Upload encrypted failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-${{ matrix.name }}
+          path: _out/
+          if-no-files-found: ignore
+          retention-days: 3
