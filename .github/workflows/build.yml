@@ -1,20 +1,5 @@
 name: Desktop build
 
-# 本仓库是公开的：只放安装包与本 workflow。InkForge 源码在私有仓库（vars.CONTENT_REPO），构建时用只读令牌临时拉取。
-# 手动（或 scripts/release.mjs 的 repository_dispatch）指定 ref 与版本号 → 三个平台各自打包 + 启动安装版冒烟
-# → 安装包直接上传到本仓库 v<版本> 的「草稿」Release（草稿只有仓库写权限的人看得到，不经过公开 artifact）。
-# 验证无误后，在 Releases 页点发布，再用本机 scripts/publish-release.mjs 登记官网。
-#
-# 公开仓库的日志谁都能看，所以：
-#   - 不用 actions/checkout（会打印提交标题 / 分支名）；用 git init + fetch，令牌只经 http.extraheader 传入单条命令；
-#   - 安装 / 构建 / 冒烟 / 上传的输出一律重定向到 _priv/，公开日志只写通过 / 失败、用时、退出码；
-#   - 失败时若配了 ARTIFACT_PASSPHRASE，把 _priv 日志加密后作为 artifact 上传，没配就不传；
-#   - 只接 workflow_dispatch / repository_dispatch，不接任何 PR 事件；
-#   - 第三方 action 固定到提交 SHA（后面注释是对应的 tag）。
-#
-# 解密失败日志：
-#   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in logs-<平台>.tar.gz.enc | tar xzf -
-
 run-name: desktop-build
 
 permissions:
