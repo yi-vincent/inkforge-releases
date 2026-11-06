@@ -52,6 +52,7 @@ jobs:
       - name: Preflight and draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           CONTENT_REPO: ${{ vars.CONTENT_REPO }}
           HAS_CONTENT_TOKEN: ${{ secrets.CONTENT_REPO_TOKEN != '' }}
         run: |
@@ -186,6 +187,7 @@ jobs:
       - name: Upload to draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set +e -uo pipefail
           source _priv/q.sh
